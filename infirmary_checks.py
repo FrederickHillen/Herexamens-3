@@ -8,6 +8,7 @@ from datetime import timedelta
 
 import pandas as pd
 
+from holders import reused_ids
 from load import load_table
 
 # Discharge times switched from JST to UTC for visits admitted from about here
@@ -87,16 +88,20 @@ issues AS (
     -- 11. severity outside 1..5
     SELECT visit_id, 'severity_out_of_range' FROM v WHERE severity NOT BETWEEN 1 AND 5
     UNION ALL
-    -- 12. unknown sorcerer, admitted before joining, or admitted after death
+    -- 12. unknown sorcerer, admitted before joining, or admitted after death.
+    --     IDs were reused (see holders.py): a visit before join_date is fine if it belongs to the first
+    --     holder (before their death); a visit after the casualty is fine if it belongs to the new holder.
     SELECT v.visit_id, 'unknown_sorcerer' FROM v
     LEFT JOIN sorcerers s USING (sorcerer_id) WHERE s.sorcerer_id IS NULL
     UNION ALL
     SELECT v.visit_id, 'admitted_before_join_date' FROM v JOIN sorcerers s USING (sorcerer_id)
     WHERE date(v.adm_utc) < s.join_date
+      AND NOT EXISTS (SELECT 1 FROM reused_ids r WHERE r.sorcerer_id = v.sorcerer_id AND v.adm_utc <= r.died_at)
     UNION ALL
     SELECT v.visit_id, 'admitted_after_death' FROM v JOIN (SELECT * FROM m WHERE casualties IS NOT NULL) m
       ON '|' || m.casualties || '|' LIKE '%|' || v.sorcerer_id || '|%'
     WHERE m.start_ts < v.adm_utc AND m.mission_id <> v.mission_id
+      AND NOT EXISTS (SELECT 1 FROM reused_ids r WHERE r.sorcerer_id = v.sorcerer_id AND v.adm_utc >= r.rejoined_at)
     UNION ALL
     -- 13. duplicate visit_id, and duplicate visits (same patient + mission)
     SELECT visit_id, 'duplicate_visit_id' FROM v WHERE visit_id IN
@@ -121,6 +126,10 @@ def _connect():
     con = sqlite3.connect(":memory:")
     for t in ("missions", "sorcerers", "infirmary_visits"):
         load_table(t).to_sql(t, con, index=False)
+    r = reused_ids()
+    for c in ("died_at", "rejoined_at"):
+        r[c] = r[c].dt.strftime("%Y-%m-%d %H:%M:%S")
+    r.to_sql("reused_ids", con, index=False)
     con.executescript(PREP_SQL)
     return con
 
@@ -138,7 +147,15 @@ def check_infirmary(summary=False):
 
 
 def fix_infirmary(out_file="infirmary_visits_fixed.csv"):
-    """Fix the infirmary data and write it to out_file (the original is not touched).
+    """Write clean_visits() to out_file (the original is not touched)."""
+    df = clean_visits()
+    df.to_csv(out_file, index=False, encoding="utf-8")
+    print(f"Wrote {len(df)} rows to {out_file} (discharge times shifted, test rows removed, severity reversed)")
+    return df
+
+
+def clean_visits():
+    """Return infirmary_visits with the safe fixes applied (timestamps stay JST).
 
     Fixes:
       * injury_code: upper-case and add the hyphen (abr01 -> ABR-01)
@@ -150,7 +167,7 @@ def fix_infirmary(out_file="infirmary_visits_fixed.csv"):
         Evidence: median stay grows with the raw value (about 3 h at 1, 240 h at 5) and
         the injury code suffix follows it (ABR-01 abrasion = 1, CRU-05 crush = 5).
       * test records (TST-00, no mission) are removed
-    Timestamps stay in JST, as in the original file. Output is UTF-8.
+    Timestamps stay in JST, as in the original file.
     NB: the injury_code_severity_mismatch check compares the code suffix with the RAW
     severity, so run check_infirmary() on the original file, not on the fixed one.
     Other problems (see check_infirmary) need a manual decision and are not changed.
@@ -166,12 +183,7 @@ def fix_infirmary(out_file="infirmary_visits_fixed.csv"):
 
     df["severity"] = 6 - df["severity"]
 
-    df = df[df["injury_code"] != "TST-00"]
-
-    df.to_csv(out_file, index=False, encoding="utf-8")
-    print(f"Wrote {len(df)} rows to {out_file} "
-          f"({int(wrong_tz.sum())} discharge times shifted, test rows removed, severity reversed)")
-    return df
+    return df[df["injury_code"] != "TST-00"].reset_index(drop=True)
 
 
 if __name__ == "__main__":

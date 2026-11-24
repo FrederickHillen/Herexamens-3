@@ -2,7 +2,8 @@
 
 B4  dictionary_errors()  -> statements in data_dictionary.md that the data contradicts, with proof
 B5  curse_log()          -> every data issue found: evidence + fix
-    write_report(path)   -> both as one markdown file
+C2  rct_section()        -> the RCT evidence definition (from rct.py), D1 answer and D2 lookalikes
+    write_report(path)   -> all of it as one markdown file
 
 Run:  python report.py [output.md]
 """
@@ -11,7 +12,9 @@ import sys
 import pandas as pd
 
 from infirmary_checks import UTC_DISCHARGE_FROM, check_infirmary
+from holders import PREVIOUS, assign_holder, reused_ids
 from load import load_table
+from rct import FLIPPED_FIRMWARE, MIN_EVIDENCE_STAYS, RCT_DEFINITION, lookalikes, rct_users, stay_evidence
 
 
 def _tables():
@@ -70,11 +73,12 @@ def _firmware(t):
     c = t["ce_wearable"]
     pos = c["ce_level"] > 0
     by_fw = c.groupby("firmware")["ce_level"].agg(["mean", "min", "max", "count"]).round(1)
-    share = (pos & (c["firmware"] == "v2.3")).sum() / pos.sum()
-    span = c.loc[c["firmware"] == "v2.3", "ts"].agg(["min", "max"]).tolist()
-    return (f"Mean ce_level by firmware: {by_fw['mean'].to_dict()}. v2.3 readings ({span[0]} to {span[1]}) are "
-            f"mostly positive (mean {by_fw.loc['v2.3', 'mean']}), v2.2/v2.4 are negative; {share:.0%} of all positive "
-            f"readings come from v2.3, so they are a sign flip, not Reverse Cursed Technique.")
+    fw = FLIPPED_FIRMWARE
+    share = (pos & (c["firmware"] == fw)).sum() / pos.sum()
+    span = c.loc[c["firmware"] == fw, "ts"].agg(["min", "max"]).tolist()
+    return (f"Mean ce_level by firmware: {by_fw['mean'].to_dict()}. {fw} readings ({span[0]} to {span[1]}) are "
+            f"mostly positive (mean {by_fw.loc[fw, 'mean']}), the other versions are negative; {share:.0%} of all "
+            f"positive readings come from {fw}, so they are a sign flip, not Reverse Cursed Technique.")
 
 
 def _barrier_units(t):
@@ -85,19 +89,35 @@ def _barrier_units(t):
             f"Kyoto min {b[b.ward_code.str[:2] == 'KY'].residual_ce.min():.0f}). Kyoto is on a different unit.")
 
 
-def _status(t):
+def _id_reuse(t):
+    """sorcerer_id is not one person: proof that killed sorcerers' IDs were given to new sorcerers."""
+    r = reused_ids()
+    a = t["device_assignments"].assign(valid_from=lambda d: pd.to_datetime(d["valid_from"]),
+                                       valid_to=lambda d: pd.to_datetime(d["valid_to"]))
+    old_dev_ends = r.merge(a, left_on=["sorcerer_id", "died_at"], right_on=["sorcerer_id", "valid_to"])
+    new_dev_starts = r.merge(a, left_on=["sorcerer_id", "rejoined_at"], right_on=["sorcerer_id", "valid_from"])
+    m = t["m"]
+    ex = m.assign(sorcerer_id=m["sorcerer_ids"].str.split("|")).explode("sorcerer_id").merge(r, on="sorcerer_id")
+    start = pd.to_datetime(ex["start_ts"])
+    after = start > ex["died_at"]
+    in_gap = after & (start < ex["rejoined_at"])
+    return (f"{len(r)} IDs ({', '.join(r['sorcerer_id'])}) appear in 'casualties' but the sorcerer on file joined "
+            f"after that death. For {len(old_dev_ends)} of them the wearable ends at the exact minute of the "
+            f"casualty and for {len(new_dev_starts)} a new wearable starts on the join date; none of the "
+            f"{int(after.sum())} missions after the death falls between death and join date ({int(in_gap.sum())}). "
+            f"Two people share each ID (e.g. S-0615: casualty 2025-12-10, joined 2026-02-02).")
+
+
+def _kia(t):
     s, m = t["sorcerers"], t["m"]
-    cas = m[m["casualties"].notna()][["end_ts", "casualties"]].rename(columns={"casualties": "sid", "end_ts": "died"})
-    ex = m.assign(sid=m["sorcerer_ids"].str.split("|")).explode("sid")[["sid", "start_ts"]]
-    later = cas.merge(ex, on="sid")
-    later = later[later["start_ts"] > later["died"]].merge(s[["sorcerer_id", "status"]], left_on="sid", right_on="sorcerer_id")
-    n_cas = cas["sid"].nunique()
-    act = later[later["status"] == "active"]
-    dec = later[later["status"] == "deceased"]
-    return (f"{n_cas} sorcerers appear in 'casualties' but only {(s['status'] == 'deceased').sum()} are status "
-            f"'deceased'. The {act['sid'].nunique()} 'active' ones go on {len(act)} missions after their supposed "
-            f"death; the deceased ones go on {len(dec)}. So those {act['sid'].nunique()} casualty entries are "
-            f"wrong (or the status is) - killed-in-action is {(s['status'] == 'deceased').sum()}, not {n_cas}.")
+    cas = m.dropna(subset=["casualties"])["casualties"].str.split("|").explode().unique()
+    active = set(cas) & set(s.loc[s["status"] == "active", "sorcerer_id"])
+    reused = set(reused_ids()["sorcerer_id"])
+    n_dec = int((s["status"] == "deceased").sum())
+    same = "exactly the reused IDs" if active == reused else f"NOT the reused IDs (differ: {sorted(active ^ reused)})"
+    return (f"{len(cas)} distinct sorcerer IDs appear in 'casualties'; {n_dec} have status 'deceased' and the other "
+            f"{len(active)} (status 'active') are {same}, whose status describes the new holder. "
+            f"So every casualty entry is a real death and status is consistent.")
 
 
 # --------------------------------------------------------------------------- B4
@@ -112,11 +132,11 @@ def dictionary_errors():
          "Un-reverse ward text that is not in wards.csv."),
         ("sorcerers", "name: Full name", _reversed_names(t), "Un-reverse the affected names."),
         ("ce_wearable", "normal readings are negative; positive = Reverse Cursed Technique", _firmware(t),
-         "Negate ce_level for firmware v2.3."),
+         f"Negate ce_level for firmware {FLIPPED_FIRMWARE} (rct.corrected_ce)."),
         ("barrier_sensors", "residual_ce: Residual cursed energy in CE units", _barrier_units(t),
          "Do not compare Tokyo and Kyoto raw; rescale Kyoto (or z-score per city)."),
-        ("sorcerers / missions", "status: active or deceased; casualties: killed in action", _status(t),
-         "Treat sorcerers with status deceased as the KIA list; flag the other casualty entries."),
+        ("sorcerers", "sorcerer_id is unique and permanent: an ID is never reused", _id_reuse(t),
+         "Join on the person, not the ID (holders.py): first holder until the casualty, new holder from join_date."),
     ]
     return pd.DataFrame(rows, columns=["table", "dictionary statement", "proof", "fix"])
 
@@ -126,6 +146,9 @@ def curse_log():
     t = _tables()
     chk = check_infirmary(summary=True).set_index("issue")["n_visits"]
     n = lambda k: int(chk.get(k, 0))
+    v = t["infirmary_visits"].assign(adm_utc=lambda d: pd.to_datetime(d["admitted_at"]) - pd.Timedelta(hours=9))
+    holder = assign_holder(v, "adm_utc")["holder"]
+    n_first = int(holder.str.endswith(PREVIOUS, na=False).sum())
     dup = len(t["missions"]) - len(t["m"])
     rows = [(r["table"], r["dictionary statement"], r["proof"], r["fix"]) for _, r in dictionary_errors().iterrows()]
     rows = [(a, f"Dictionary wrong: {b}", c, d) for a, b, c, d in rows]
@@ -147,10 +170,13 @@ def curse_log():
         ("infirmary_visits", "On other mission at admission",
          f"{n('on_other_mission_at_admission')} visits where the patient was on another mission when admitted.",
          "Not changed: needs a decision."),
-        ("infirmary_visits", "Admitted before join date", f"{n('admitted_before_join_date')} visits.",
-         "Not changed: check sorcerers.join_date."),
-        ("infirmary_visits", "Admitted after death", f"{n('admitted_after_death')} visits after a casualty record.",
-         "Not changed: see casualty/status finding."),
+        ("sorcerers / missions", "Casualties of sorcerers with status 'active'", _kia(t),
+         "Keep them: killed in action = every distinct casualty (queries.killed_in_action)."),
+        ("infirmary_visits", "Admitted before join date / after death",
+         f"{n_first} visits belong to the first (dead) holder of a reused ID; joined on the bare ID they looked like "
+         f"visits before joining / after death. Split by holder, {n('admitted_before_join_date')} before join and "
+         f"{n('admitted_after_death')} after death remain, all of them TST-00 test records.",
+         "Remove the test records; the rest is the first holder's history, not an error."),
         ("infirmary_visits", "Overlapping visits", f"{n('overlapping_visit')} visits overlap another visit of the same patient.",
          "Not changed: needs a decision."),
     ]
@@ -168,9 +194,30 @@ def _md(df, title):
     return "\n".join(out)
 
 
+def rct_section():
+    ev = stay_evidence()
+    users = rct_users()
+    return "\n".join([
+        "## C2 - Evidence of RCT", "",
+        f"**Definition:** {RCT_DEFINITION}", "",
+        "Implemented once as `rct.is_rct_evidence()`; every other script imports it from `rct.py`.", "",
+        f"- {int(ev['is_rct_evidence'].sum())} of {len(ev)} stays count as evidence.",
+        "",
+        f"## D1 - Living RCT users (at least {MIN_EVIDENCE_STAYS} evidence stays)", "",
+        *[f"- **{r.sorcerer_id}** {r.name} (grade {r.grade}, {r.school}): {r.evidence_stays} evidence stays"
+          for r in users.itertuples()],
+        "",
+        "## D2 - Lookalikes and why they are not RCT users", "",
+        *[f"- **{r.holder}** {r.name if isinstance(r.name, str) else '(first holder, not on file)'}: {r.why_not_rct}"
+          for r in lookalikes().itertuples()],
+        "",
+    ])
+
+
 def write_report(path="report.md"):
     text = (_md(dictionary_errors(), "B4 - Wrong statements in the data dictionary")
-            + "\n" + _md(curse_log(), "B5 - Curse log"))
+            + "\n" + _md(curse_log(), "B5 - Curse log")
+            + "\n" + rct_section())
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return text

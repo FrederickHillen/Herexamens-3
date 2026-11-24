@@ -2,11 +2,14 @@ import sqlite3
 
 import pandas as pd
 
+from infirmary_checks import clean_visits
 from load import load_table
 
 con = sqlite3.connect(":memory:")
 for table in ("missions", "barrier_sensors", "infirmary_visits"):
     load_table(table).to_sql(table, con, index=False)
+# Repaired infirmary visits (discharge UTC->JST from 2026-02-28, severity 1 = critical, test rows removed)
+clean_visits().to_sql("infirmary_clean", con, index=False)
 
 QUERY = """
 SELECT * FROM missions LIMIT 5
@@ -67,13 +70,16 @@ def killed_in_action():
 def median_recovery_time_by_severity():
     """Return the median recovery time in hours per severity level.
 
-    Recovery time = discharged_at - admitted_at (both JST, so no timezone shift needed).
+    Recovery time = discharged_at - admitted_at, in hours. A duration needs both ends on the same clock:
+    admitted_at is JST, but discharged_at is UTC for visits admitted from 2026-02-28 (9 h too short,
+    1086 even negative). So it is computed on clean_visits(), which moves those discharges back to JST,
+    reverses severity to the dictionary's 1 = critical ... 5 = minor and drops the TST-00 test records.
     """
     sql = """
     WITH recovery AS (
         SELECT severity,
                (julianday(discharged_at) - julianday(admitted_at)) * 24 AS hours
-        FROM infirmary_visits
+        FROM infirmary_clean
         WHERE admitted_at IS NOT NULL AND discharged_at IS NOT NULL
     ),
     ordered AS (
