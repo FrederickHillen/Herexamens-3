@@ -90,6 +90,25 @@ def median_recovery_time_by_severity():
     """
     return pd.read_sql_query(sql, con)
 
+def post_mortem():
+    sql = """WITH RECURSIVE
+    m AS (SELECT DISTINCT * FROM missions),                       -- drop exact duplicate rows
+    cas AS (SELECT mission_id, end_ts AS died_at, casualties AS sorcerer_id
+            FROM m WHERE casualties IS NOT NULL),
+    sp(mission_id, sorcerer_id, rest) AS (                        -- split 'S-0001|S-0002'
+    SELECT mission_id, '', sorcerer_ids || '|' FROM m
+    UNION ALL SELECT mission_id, substr(rest,1,instr(rest,'|')-1), substr(rest,instr(rest,'|')+1)
+    FROM sp WHERE rest <> ''),
+    ms AS (SELECT mission_id, sorcerer_id FROM sp WHERE sorcerer_id <> '')
+    SELECT s.sorcerer_id, s.name, s.status, c.mission_id AS casualty_mission, c.died_at,
+        COUNT(m2.mission_id) AS missions_after_death, MAX(m2.start_ts) AS last_mission
+    FROM cas c
+    JOIN sorcerers s USING (sorcerer_id)
+    LEFT JOIN ms ON ms.sorcerer_id = c.sorcerer_id
+    LEFT JOIN m m2 ON m2.mission_id = ms.mission_id AND m2.start_ts > c.died_at
+    WHERE s.status <> 'deceased'
+    GROUP BY s.sorcerer_id ORDER BY c.died_at"""
+    return pd.read_sql_query(sql, con)
 
 if __name__ == "__main__":
     pd.set_option("display.width", 200, "display.max_columns", 50, "display.max_colwidth", 60)
