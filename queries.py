@@ -27,24 +27,24 @@ def killed_in_action():
     """Return the number of sorcerers killed in action between May 2025 and Oct 2026."""
     return pd.read_sql_query(
         """WITH RECURSIVE
-dedup AS (  -- the missions file contains exact duplicate rows
-    SELECT DISTINCT mission_id, end_ts, casualties
-    FROM missions
-    WHERE casualties IS NOT NULL
-),
-split(mission_id, ts, sorcerer_id, rest) AS (  -- 'S-0001|S-0002' -> one row per ID
-    SELECT mission_id, end_ts, '', casualties || '|' FROM dedup
-    UNION ALL
-    SELECT mission_id, ts,
-           substr(rest, 1, instr(rest, '|') - 1),
-           substr(rest, instr(rest, '|') + 1)
-    FROM split WHERE rest <> ''
-)
-SELECT COUNT(DISTINCT sorcerer_id) AS killed
-FROM split
-WHERE sorcerer_id <> '' AND ts >= '2025-05-01' AND ts < '2026-11-01'""",
-        con,
+    dedupe AS (
+        SELECT DISTINCT mission_id, end_ts, casualties
+        FROM missions
+        WHERE casualties IS NOT NULL
+    ),
+    split(mission_id, ts, sorcerer_id, rest) AS (
+        SELECT mission_id, end_ts, '', casualties || '|' FROM dedupe
+        UNION ALL
+        SELECT mission_id, ts,
+            substr(rest, 1, instr(rest, '|') - 1),
+            substr(rest, instr(rest, '|') + 1)
+        FROM split WHERE rest <> ''
+    )
+    SELECT COUNT(DISTINCT sorcerer_id) AS killed
+    FROM split
+    WHERE sorcerer_id <> '' AND ts >= '2025-05-01' AND ts < '2026-11-01'""",con,
     ).iloc[0, 0]
+
 
 
 if __name__ == "__main__":
