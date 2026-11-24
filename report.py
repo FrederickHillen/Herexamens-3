@@ -3,6 +3,7 @@
 B4  dictionary_errors()  -> statements in data_dictionary.md that the data contradicts, with proof
 B5  curse_log()          -> every data issue found: evidence + fix
 C2  rct_section()        -> the RCT evidence definition (from rct.py), D1 answer and D2 lookalikes
+Bonus host_section()     -> the Inverter's host and the evidence (from host.py)
     write_report(path)   -> all of it as one markdown file
 
 Run:  python report.py [output.md]
@@ -11,10 +12,12 @@ import sys
 
 import pandas as pd
 
-from infirmary_checks import UTC_DISCHARGE_FROM, check_infirmary
+from infirmary_checks import UTC_CLOCK_CHANGE, check_infirmary, discharge_is_utc
 from holders import PREVIOUS, assign_holder, reused_ids
+from host import host_evidence
 from load import load_table
-from rct import FLIPPED_FIRMWARE, MIN_EVIDENCE_STAYS, RCT_DEFINITION, lookalikes, rct_users, stay_evidence
+from rct import (FLIPPED_FIRMWARE, MIN_EVIDENCE_STAYS, RCT_DEFINITION, healer_effect, lookalikes, rct_users,
+                 stay_evidence)
 
 
 def _tables():
@@ -29,12 +32,14 @@ def _infirmary_timezone(t):
     v = t["infirmary_visits"]
     adm, dis = pd.to_datetime(v["admitted_at"]), pd.to_datetime(v["discharged_at"])
     stay = (dis - adm).dt.total_seconds() / 3600
-    late = adm >= UTC_DISCHARGE_FROM
+    late = discharge_is_utc(v["admitted_at"], v["discharged_at"])
+    neg = stay < 0
     med_before = stay[~late & (v["severity"] == 1)].median()
     med_after = stay[late & (v["severity"] == 1)].median()
-    return (f"{int((stay < 0).sum())} visits are discharged before they are admitted, all admitted on/after "
-            f"{UTC_DISCHARGE_FROM:%Y-%m-%d}; none before. Median stay of the shortest-stay severity group is "
-            f"{med_before:.1f} h before that date and {med_after:.1f} h after (about 9 h less). "
+    return (f"{int(neg.sum())} visits are discharged before they are admitted, all with a discharge stamp from "
+            f"{dis[neg].min():%Y-%m-%d %H:%M} on, none earlier: the discharge terminal's clock was switched to UTC "
+            f"at {UTC_CLOCK_CHANGE:%Y-%m-%d %H:%M} UTC (audit_log). Median stay of the shortest-stay severity group "
+            f"is {med_before:.1f} h before the switch and {med_after:.1f} h after (about 9 h less). "
             f"Admissions are consistent with JST: they follow mission end (UTC) by 20-179 min only after "
             f"subtracting 9 h.")
 
@@ -42,7 +47,7 @@ def _infirmary_timezone(t):
 def _severity(t):
     v = t["infirmary_visits"]
     adm, dis = pd.to_datetime(v["admitted_at"]), pd.to_datetime(v["discharged_at"])
-    early = adm < UTC_DISCHARGE_FROM  # discharge times are reliable before the switch
+    early = ~discharge_is_utc(v["admitted_at"], v["discharged_at"])  # reliable before the clock switch
     med = ((dis - adm).dt.total_seconds() / 3600)[early].groupby(v["severity"][early]).median().round(0)
     code = v[v["injury_code"].str.upper().str[:3].isin(["ABR", "CRU"])].assign(
         c=lambda x: x["injury_code"].str.upper().str[:3]).groupby("c")["severity"].agg(lambda s: s.mode()[0])
@@ -108,6 +113,21 @@ def _id_reuse(t):
             f"Two people share each ID (e.g. S-0615: casualty 2025-12-10, joined 2026-02-02).")
 
 
+def _sessions_outside_stays():
+    """Drop 1: healer sessions while the patient has no infirmary stay on record."""
+    from rct import _sessions, stay_evidence
+    h = _sessions()
+    if h is None:
+        return None
+    ev = stay_evidence()
+    x = h.merge(ev[["sorcerer_id", "adm_utc", "dis_utc"]], left_on="patient_id", right_on="sorcerer_id")
+    inside = set(x.loc[(x["start"] < x["dis_utc"]) & (x["end"] > x["adm_utc"]), "session_id"])
+    out = h[~h["session_id"].isin(inside)]
+    return (f"{len(out)} of {len(h)} healer sessions ({out['patient_id'].nunique()} patients) happen while the patient "
+            f"has no infirmary stay on record, often 2-3 sessions within a day or two. Both wearables confirm each "
+            f"session (healer and patient positive for the whole session), so the visits are probably missing.")
+
+
 def _kia(t):
     s, m = t["sorcerers"], t["m"]
     cas = m.dropna(subset=["casualties"])["casualties"].str.split("|").explode().unique()
@@ -125,7 +145,7 @@ def dictionary_errors():
     t = _tables()
     rows = [
         ("infirmary_visits", "All timestamps are Japan Standard Time (JST)",
-         _infirmary_timezone(t), "discharged_at is UTC for visits admitted from end of Feb 2026: add 9 h."),
+         _infirmary_timezone(t), "discharged_at stamped after the UTC clock switch (discharge_is_utc): add 9 h."),
         ("infirmary_visits", "severity: 1 = critical ... 5 = minor", _severity(t),
          "Reverse the scale (6 - severity)."),
         ("missions", "ward: Ward name (romaji)", _mission_ward(t),
@@ -172,6 +192,9 @@ def curse_log():
          "Not changed: needs a decision."),
         ("sorcerers / missions", "Casualties of sorcerers with status 'active'", _kia(t),
          "Keep them: killed in action = every distinct casualty (queries.killed_in_action)."),
+        *([("healer_sessions", "Sessions without an infirmary stay", _sessions_outside_stays(),
+            "Not changed: check against infirmary_corrections (drop 2); not used as RCT evidence.")]
+          if _sessions_outside_stays() else []),
         ("infirmary_visits", "Admitted before join date / after death",
          f"{n_first} visits belong to the first (dead) holder of a reused ID; joined on the bare ID they looked like "
          f"visits before joining / after death. Split by holder, {n('admitted_before_join_date')} before join and "
@@ -194,6 +217,17 @@ def _md(df, title):
     return "\n".join(out)
 
 
+def _healer_lines():
+    t, treated_fast = healer_effect()
+    if not t["healer_present"].any():
+        return []
+    w = t[t["healer_present"]]
+    return [f"Healer sessions (drop 1): serious stays treated by a healer heal at a median "
+            f"{w['median'].min():.2f}-{w['median'].max():.2f}x the normal time. None of the users above had a healer "
+            f"in an evidence stay; the only fast serious recoveries with a healer present are "
+            f"{', '.join(treated_fast) or 'none'} (see D2).", ""]
+
+
 def rct_section():
     ev = stay_evidence()
     users = rct_users()
@@ -207,6 +241,7 @@ def rct_section():
         *[f"- **{r.sorcerer_id}** {r.name} (grade {r.grade}, {r.school}): {r.evidence_stays} evidence stays"
           for r in users.itertuples()],
         "",
+        *_healer_lines(),
         "## D2 - Lookalikes and why they are not RCT users", "",
         *[f"- **{r.holder}** {r.name if isinstance(r.name, str) else '(first holder, not on file)'}: {r.why_not_rct}"
           for r in lookalikes().itertuples()],
@@ -214,10 +249,19 @@ def rct_section():
     ])
 
 
+def host_section():
+    try:
+        lines = host_evidence()
+    except FileNotFoundError:  # audit_log arrives with drop 2
+        return ""
+    return "\n".join(["## Bonus - The Inverter's host", "", *lines, ""])
+
+
 def write_report(path="report.md"):
     text = (_md(dictionary_errors(), "B4 - Wrong statements in the data dictionary")
             + "\n" + _md(curse_log(), "B5 - Curse log")
-            + "\n" + rct_section())
+            + "\n" + rct_section()
+            + "\n" + host_section())
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return text

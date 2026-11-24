@@ -11,9 +11,21 @@ import pandas as pd
 from holders import reused_ids
 from load import load_table
 
-# Discharge times switched from JST to UTC for visits admitted from about here
-# (first visit that ends before it starts: V-004514, admitted 2026-02-28 19:14).
+# The discharge terminal's clock source was switched to UTC (audit_log A-028981, account hlr.minase.i,
+# 2026-02-28 17:47 UTC). From then on discharged_at is stamped in UTC while admitted_at stays JST.
+UTC_CLOCK_CHANGE = pd.Timestamp("2026-02-28 17:47")  # UTC
+# Older approximation by admission time (first visit that ends before it starts: V-004514, admitted
+# 2026-02-28 19:14 JST). Kept for scripts that still import it; use discharge_is_utc() instead.
 UTC_DISCHARGE_FROM = pd.Timestamp("2026-02-28 15:00")
+
+
+def discharge_is_utc(admitted_at, discharged_at):
+    """True where discharged_at was stamped in UTC: the stamp is at/after the clock change, or it lies before
+    its own admission (only possible on the UTC clock; V-004514 shows the switch began minutes before the
+    audit entry). Stamps in the 9 h either side of the change are ambiguous (~6 visits); those after
+    17:47 are read as UTC."""
+    adm, dis = pd.to_datetime(admitted_at), pd.to_datetime(discharged_at)
+    return (dis >= UTC_CLOCK_CHANGE) | (dis < adm)
 
 
 PREP_SQL = """
@@ -30,11 +42,12 @@ CREATE INDEX ms_s ON mission_sorcerers(sorcerer_id); CREATE INDEX ms_m ON missio
 CHECK_SQL_TEMPLATE = """
 WITH
 v AS (  -- infirmary visits with JST converted to UTC
-    -- discharge times of later visits are already UTC, so they get no -9h (see UTC_DISCHARGE_FROM)
+    -- discharges stamped after the clock change are already UTC, so they get no -9h (see discharge_is_utc)
     SELECT *, datetime(admitted_at || ':00', '-9 hours') AS adm_utc,
-              CASE WHEN admitted_at >= '__CUTOFF__' THEN datetime(discharged_at || ':00')
+              CASE WHEN discharged_at >= '__CUTOFF__' OR discharged_at < admitted_at
+                   THEN datetime(discharged_at || ':00')
                    ELSE datetime(discharged_at || ':00', '-9 hours') END AS dis_utc,
-              admitted_at >= '__CUTOFF__' AS dis_is_utc
+              (discharged_at >= '__CUTOFF__' OR discharged_at < admitted_at) AS dis_is_utc
     FROM infirmary_visits
 ),
 issues AS (
@@ -119,7 +132,7 @@ issues AS (
 )
 SELECT visit_id, issue FROM issues ORDER BY visit_id, issue
 """
-CHECK_SQL = CHECK_SQL_TEMPLATE.replace("__CUTOFF__", UTC_DISCHARGE_FROM.strftime("%Y-%m-%d %H:%M"))
+CHECK_SQL = CHECK_SQL_TEMPLATE.replace("__CUTOFF__", UTC_CLOCK_CHANGE.strftime("%Y-%m-%d %H:%M"))
 
 
 def _connect():
@@ -159,8 +172,8 @@ def clean_visits():
 
     Fixes:
       * injury_code: upper-case and add the hyphen (abr01 -> ABR-01)
-      * discharged_at: from visits admitted on/after UTC_DISCHARGE_FROM (end of Feb 2026) the
-        discharge time was stamped in UTC instead of JST -> add 9 hours to ALL of them
+      * discharged_at: stamps made after the terminal clock was switched to UTC (UTC_CLOCK_CHANGE,
+        see discharge_is_utc) are UTC instead of JST -> add 9 hours to ALL of them
         (not only the ones that ended up before admission)
       * severity: the file has 1 = minor ... 5 = critical, the opposite of the data dictionary
         (1 = critical ... 5 = minor), so it is reversed (severity = 6 - severity).
@@ -176,9 +189,8 @@ def clean_visits():
 
     df["injury_code"] = df["injury_code"].str.upper().str.replace(r"^([A-Z]{3})-?(\d{2})$", r"\1-\2", regex=True)
 
-    adm = pd.to_datetime(df["admitted_at"])
     dis = pd.to_datetime(df["discharged_at"])
-    wrong_tz = adm >= UTC_DISCHARGE_FROM
+    wrong_tz = discharge_is_utc(df["admitted_at"], df["discharged_at"])
     df.loc[wrong_tz, "discharged_at"] = (dis[wrong_tz] + timedelta(hours=9)).dt.strftime("%Y-%m-%d %H:%M")
 
     df["severity"] = 6 - df["severity"]
