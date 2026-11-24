@@ -5,7 +5,7 @@ import pandas as pd
 from load import load_table
 
 con = sqlite3.connect(":memory:")
-for table in ("missions", "barrier_sensors"):
+for table in ("missions", "barrier_sensors", "infirmary_visits"):
     load_table(table).to_sql(table, con, index=False)
 
 QUERY = """
@@ -38,6 +38,7 @@ def median_residual_cursed_energy():
     WHERE rn IN ((n + 1) / 2, (n + 2) / 2)
     """
     return pd.read_sql_query(sql, con).iloc[0, 0]
+
 # B3
 def killed_in_action():
     """Return the number of sorcerers killed in action between May 2025 and Oct 2026."""
@@ -62,6 +63,33 @@ def killed_in_action():
     ).iloc[0, 0]
 
 
+# C1
+def median_recovery_time_by_severity():
+    """Return the median recovery time in hours per severity level.
+
+    Recovery time = discharged_at - admitted_at (both JST, so no timezone shift needed).
+    """
+    sql = """
+    WITH recovery AS (
+        SELECT severity,
+               (julianday(discharged_at) - julianday(admitted_at)) * 24 AS hours
+        FROM infirmary_visits
+        WHERE admitted_at IS NOT NULL AND discharged_at IS NOT NULL
+    ),
+    ordered AS (
+        SELECT severity, hours,
+               ROW_NUMBER() OVER (PARTITION BY severity ORDER BY hours) AS rn,
+               COUNT(*) OVER (PARTITION BY severity) AS n
+        FROM recovery
+    )
+    SELECT severity, ROUND(AVG(hours), 2) AS median_recovery_hours
+    FROM ordered
+    WHERE rn IN ((n + 1) / 2, (n + 2) / 2)
+    GROUP BY severity
+    ORDER BY severity
+    """
+    return pd.read_sql_query(sql, con)
+
 
 if __name__ == "__main__":
     pd.set_option("display.width", 200, "display.max_columns", 50, "display.max_colwidth", 60)
@@ -70,3 +98,4 @@ if __name__ == "__main__":
     print(f"\nNumber of unique wards in missions: {unique_wards_missions()}")
     print(f"\nMedian residual cursed energy in barrier_sensors: {median_residual_cursed_energy()}")
     print(f"\nSorcerers killed in action (May 2025 - Oct 2026): {killed_in_action()}")
+    print(f"\nMedian recovery time (hours) by severity: {median_recovery_time_by_severity().to_string(index=False)}")
